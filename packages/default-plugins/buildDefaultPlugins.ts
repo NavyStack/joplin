@@ -1,7 +1,7 @@
 
 /* eslint-disable no-console */
 
-import { copy, exists, remove, mkdirp, readdir, mkdtemp, readFile, writeFile } from 'fs-extra';
+import { copy, exists, remove, mkdirp, readdir, mkdtemp } from 'fs-extra';
 import { join, resolve, basename } from 'path';
 import { tmpdir } from 'os';
 import { chdir, cwd } from 'process';
@@ -47,7 +47,14 @@ const buildDefaultPlugins = async (outputParentDir: string|null, beforeInstall: 
 			if (currentCommitHash !== expectedCommitHash) {
 				logStatus(`Switching to commit ${expectedCommitHash}`);
 				await execCommand(['git', 'switch', repositoryData.branch]);
-				await execCommand(['git', 'checkout', expectedCommitHash]);
+
+				try {
+					await execCommand(['git', 'checkout', expectedCommitHash]);
+				} catch (error) {
+					logStatus(`git checkout failed with error ${error}. Fetching...`);
+					await execCommand(['git', 'fetch']);
+					await execCommand(['git', 'checkout', expectedCommitHash]);
+				}
 			}
 
 			logStatus('Copying repository files...');
@@ -61,12 +68,6 @@ const buildDefaultPlugins = async (outputParentDir: string|null, beforeInstall: 
 
 			logStatus('Initializing repository.');
 			await execCommand('git init . -b main');
-
-			logStatus('Marking manifest as built-in');
-			const manifestFile = './src/manifest.json';
-			const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
-			manifest._built_in = true;
-			await writeFile(manifestFile, JSON.stringify(manifest, undefined, '\t'));
 
 			logStatus('Creating initial commit.');
 			await execCommand('git add .');

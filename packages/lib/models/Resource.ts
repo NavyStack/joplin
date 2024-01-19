@@ -7,9 +7,9 @@ import markdownUtils from '../markdownUtils';
 import { _ } from '../locale';
 import { ResourceEntity, ResourceLocalStateEntity, ResourceOcrStatus, SqlQuery } from '../services/database/types';
 import ResourceLocalState from './ResourceLocalState';
-const pathUtils = require('../path-utils');
+import * as pathUtils from '../path-utils';
+import { safeFilename } from '../path-utils';
 const { mime } = require('../mime-utils.js');
-const { filename, safeFilename } = require('../path-utils');
 const { FsDriverDummy } = require('../fs-driver-dummy.js');
 import JoplinError from '../JoplinError';
 import itemCanBeEncrypted from './utils/itemCanBeEncrypted';
@@ -22,6 +22,8 @@ import { htmlentities } from '@joplin/utils/html';
 import { RecognizeResultLine } from '../services/ocr/utils/types';
 import eventManager, { EventName } from '../eventManager';
 import { unique } from '../array';
+import isSqliteSyntaxError from '../services/database/isSqliteSyntaxError';
+import { internalUrl, isResourceUrl, isSupportedImageMimeType, resourceFilename, resourceFullPath, resourcePathToId, resourceRelativePath, resourceUrlToId } from './utils/resourceUtils';
 
 export default class Resource extends BaseItem {
 
@@ -55,8 +57,7 @@ export default class Resource extends BaseItem {
 	}
 
 	public static isSupportedImageMimeType(type: string) {
-		const imageMimeTypes = ['image/jpg', 'image/jpeg', 'image/png', 'image/gif', 'image/svg+xml', 'image/webp', 'image/avif'];
-		return imageMimeTypes.indexOf(type.toLowerCase()) >= 0;
+		return isSupportedImageMimeType(type);
 	}
 
 	public static fetchStatuses(resourceIds: string[]): Promise<any[]> {
@@ -120,10 +121,7 @@ export default class Resource extends BaseItem {
 	}
 
 	public static filename(resource: ResourceEntity, encryptedBlob = false) {
-		let extension = encryptedBlob ? 'crypted' : resource.file_extension;
-		if (!extension) extension = resource.mime ? mime.toFileExtension(resource.mime) : '';
-		extension = extension ? `.${extension}` : '';
-		return resource.id + extension;
+		return resourceFilename(resource, encryptedBlob);
 	}
 
 	public static friendlySafeFilename(resource: ResourceEntity) {
@@ -136,11 +134,11 @@ export default class Resource extends BaseItem {
 	}
 
 	public static relativePath(resource: ResourceEntity, encryptedBlob = false) {
-		return `${Setting.value('resourceDirName')}/${this.filename(resource, encryptedBlob)}`;
+		return resourceRelativePath(resource, this.baseRelativeDirectoryPath(), encryptedBlob);
 	}
 
 	public static fullPath(resource: ResourceEntity, encryptedBlob = false) {
-		return `${Setting.value('resourceDir')}/${this.filename(resource, encryptedBlob)}`;
+		return resourceFullPath(resource, this.baseDirectoryPath(), encryptedBlob);
 	}
 
 	public static async isReady(resource: ResourceEntity) {
@@ -269,11 +267,11 @@ export default class Resource extends BaseItem {
 	}
 
 	public static internalUrl(resource: ResourceEntity) {
-		return `:/${resource.id}`;
+		return internalUrl(resource);
 	}
 
 	public static pathToId(path: string) {
-		return filename(path);
+		return resourcePathToId(path);
 	}
 
 	public static async content(resource: ResourceEntity) {
@@ -281,12 +279,11 @@ export default class Resource extends BaseItem {
 	}
 
 	public static isResourceUrl(url: string) {
-		return url && url.length === 34 && url[0] === ':' && url[1] === '/';
+		return isResourceUrl(url);
 	}
 
 	public static urlToId(url: string) {
-		if (!this.isResourceUrl(url)) throw new Error(`Not a valid resource URL: ${url}`);
-		return url.substr(2);
+		return resourceUrlToId(url);
 	}
 
 	public static async localState(resourceOrId: any): Promise<ResourceLocalStateEntity> {
@@ -553,15 +550,47 @@ export default class Resource extends BaseItem {
 		return this.modelSelectAll(`SELECT id, ocr_text FROM resources WHERE id IN ("${ids.join('","')}")`);
 	}
 
-	public static allForNormalization(updatedTime: number, id: string, limit = 100, options: LoadOptions = null) {
-		return this.modelSelectAll<ResourceEntity>(`
-			SELECT ${this.selectFields(options)} FROM resources
-			WHERE (updated_time, id) > (?, ?)
-			AND ocr_text != ""
-			AND ocr_status = ?
-			ORDER BY updated_time ASC, id ASC
-			LIMIT ?
-		`, [updatedTime, id, ResourceOcrStatus.Done, limit]);
+	public static async allForNormalization(updatedTime: number, id: string, limit = 100, options: LoadOptions = null) {
+		const makeQuery = (useRowValue: boolean): SqlQuery => {
+			const whereSql = useRowValue ? '(updated_time, id) > (?, ?)' : 'updated_time > ?';
+
+			const params: any[] = [updatedTime];
+			if (useRowValue) {
+				params.push(id);
+			}
+			params.push(ResourceOcrStatus.Done);
+			params.push(limit);
+
+			return {
+				sql: `
+					SELECT ${this.selectFields(options)} FROM resources
+					WHERE ${whereSql}
+					AND ocr_text != ""
+					AND ocr_status = ?
+					ORDER BY updated_time ASC, id ASC
+					LIMIT ?
+				`,
+				params,
+			};
+		};
+
+		// We use a row value in this query, and that's not supported on certain
+		// Android devices (API level <= 24). So if the query fails, we fallback
+		// to a non-row value query. Although it may be inaccurate in some cases
+		// it wouldn't be a critical issue (some OCRed resources may not be part
+		// of the search engine results) and it means we can keep supporting old
+		// Android devices.
+		try {
+			const r = await this.modelSelectAll(makeQuery(true));
+			return r;
+		} catch (error) {
+			if (isSqliteSyntaxError(error)) {
+				const r = await this.modelSelectAll(makeQuery(false));
+				return r;
+			} else {
+				throw error;
+			}
+		}
 	}
 
 	public static async save(o: ResourceEntity, options: SaveOptions = null): Promise<ResourceEntity> {

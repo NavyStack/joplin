@@ -22,7 +22,6 @@ import stateToWhenClauseContext from './services/commands/stateToWhenClauseConte
 import ResourceService from '@joplin/lib/services/ResourceService';
 import ExternalEditWatcher from '@joplin/lib/services/ExternalEditWatcher';
 import appReducer, { createAppDefaultState } from './app.reducer';
-const { FoldersScreenUtils } = require('@joplin/lib/folders-screen-utils.js');
 import Folder from '@joplin/lib/models/Folder';
 import Tag from '@joplin/lib/models/Tag';
 import { reg } from '@joplin/lib/registry';
@@ -65,13 +64,14 @@ import { AppState } from './app.reducer';
 import syncDebugLog from '@joplin/lib/services/synchronizer/syncDebugLog';
 import eventManager, { EventName } from '@joplin/lib/eventManager';
 import path = require('path');
-import { checkPreInstalledDefaultPlugins, installDefaultPlugins, setSettingsForDefaultPlugins } from '@joplin/lib/services/plugins/defaultPlugins/defaultPluginsUtils';
+import { afterDefaultPluginsLoaded, loadAndRunDefaultPlugins } from '@joplin/lib/services/plugins/defaultPlugins/defaultPluginsUtils';
 import userFetcher, { initializeUserFetcher } from '@joplin/lib/utils/userFetcher';
 import { parseNotesParent } from '@joplin/lib/reducer';
 import OcrService from '@joplin/lib/services/ocr/OcrService';
 import OcrDriverTesseract from '@joplin/lib/services/ocr/drivers/OcrDriverTesseract';
-import SearchEngine from '@joplin/lib/services/searchengine/SearchEngine';
+import SearchEngine from '@joplin/lib/services/search/SearchEngine';
 import { PackageInfo } from '@joplin/lib/versionInfo';
+import { refreshFolders } from '@joplin/lib/folders-screen-utils';
 
 const pluginClasses = [
 	require('./plugins/GotoAnything').default,
@@ -127,6 +127,10 @@ class Application extends BaseApplication {
 
 		if (action.type === 'SETTING_UPDATE_ONE' && action.key === 'ocr.enabled' || action.type === 'SETTING_UPDATE_ALL') {
 			this.setupOcrService();
+		}
+
+		if (action.type === 'SETTING_UPDATE_ONE' && action.key === 'autoUploadCrashDumps') {
+			bridge().autoUploadCrashDumps = action.value;
 		}
 
 		if (action.type === 'SETTING_UPDATE_ONE' && action.key === 'style.editor.fontFamily' || action.type === 'SETTING_UPDATE_ALL') {
@@ -277,7 +281,6 @@ class Application extends BaseApplication {
 		const pluginRunner = new PluginRunner();
 		service.initialize(packageInfo.version, PlatformImplementation.instance(), pluginRunner, this.store());
 		service.isSafeMode = Setting.value('isSafeMode');
-		const defaultPluginsId = Object.keys(getDefaultPluginsInfo());
 
 		let pluginSettings = service.unserializePluginSettings(Setting.value('plugins.states'));
 		{
@@ -285,15 +288,11 @@ class Application extends BaseApplication {
 			// time, however we only effectively uninstall the plugin the next
 			// time the app is started. What plugin should be uninstalled is
 			// stored in the settings.
-			const newSettings = service.clearUpdateState(await service.uninstallPlugins(pluginSettings));
-			Setting.setValue('plugins.states', newSettings);
+			pluginSettings = service.clearUpdateState(await service.uninstallPlugins(pluginSettings));
+			Setting.setValue('plugins.states', pluginSettings);
 		}
 
-		checkPreInstalledDefaultPlugins(defaultPluginsId, pluginSettings);
-
 		try {
-			const defaultPluginsDir = path.join(bridge().buildDir(), 'defaultPlugins');
-			pluginSettings = await installDefaultPlugins(service, defaultPluginsDir, defaultPluginsId, pluginSettings);
 			if (await shim.fsDriver().exists(Setting.value('pluginDir'))) {
 				await service.loadAndRunPlugins(Setting.value('pluginDir'), pluginSettings);
 			}
@@ -302,17 +301,29 @@ class Application extends BaseApplication {
 		}
 
 		try {
+			const devPluginOptions = { devMode: true, builtIn: false };
+
 			if (Setting.value('plugins.devPluginPaths')) {
 				const paths = Setting.value('plugins.devPluginPaths').split(',').map((p: string) => p.trim());
-				await service.loadAndRunPlugins(paths, pluginSettings, true);
+				await service.loadAndRunPlugins(paths, pluginSettings, devPluginOptions);
 			}
 
 			// Also load dev plugins that have passed via command line arguments
 			if (Setting.value('startupDevPlugins')) {
-				await service.loadAndRunPlugins(Setting.value('startupDevPlugins'), pluginSettings, true);
+				await service.loadAndRunPlugins(Setting.value('startupDevPlugins'), pluginSettings, devPluginOptions);
 			}
 		} catch (error) {
 			this.logger().error(`There was an error loading plugins from ${Setting.value('plugins.devPluginPaths')}:`, error);
+		}
+
+		// Load default plugins after loading other plugins -- this allows users
+		// to override built-in plugins with development versions with the same
+		// ID.
+		const defaultPluginsDir = path.join(bridge().buildDir(), 'defaultPlugins');
+		try {
+			pluginSettings = await loadAndRunDefaultPlugins(service, defaultPluginsDir, getDefaultPluginsInfo(), pluginSettings);
+		} catch (error) {
+			this.logger().error(`There was an error loading plugins from ${defaultPluginsDir}:`, error);
 		}
 
 		{
@@ -322,7 +333,7 @@ class Application extends BaseApplication {
 			// out we remove from the state any plugin that has *not* been loaded
 			// above (meaning the file was missing).
 			// https://github.com/laurent22/joplin/issues/5253
-			const oldSettings = service.unserializePluginSettings(Setting.value('plugins.states'));
+			const oldSettings = pluginSettings;
 			const newSettings: PluginSettings = {};
 			for (const pluginId of Object.keys(oldSettings)) {
 				if (!service.pluginIds.includes(pluginId)) {
@@ -332,6 +343,7 @@ class Application extends BaseApplication {
 				newSettings[pluginId] = oldSettings[pluginId];
 			}
 			Setting.setValue('plugins.states', newSettings);
+			pluginSettings = newSettings;
 		}
 
 		this.checkAllPluginStartedIID_ = setInterval(() => {
@@ -346,7 +358,7 @@ class Application extends BaseApplication {
 				// tests to wait for plugins to load.
 				ipcRenderer.send('startup-plugins-loaded');
 
-				setSettingsForDefaultPlugins(getDefaultPluginsInfo());
+				void afterDefaultPluginsLoaded(service.plugins, getDefaultPluginsInfo(), pluginSettings);
 			}
 		}, 500);
 	}
@@ -397,6 +409,8 @@ class Application extends BaseApplication {
 		if (!bridge().electronIsDev()) argv.splice(1, 0, '.');
 
 		argv = await super.start(argv);
+
+		bridge().autoUploadCrashDumps = Setting.value('autoUploadCrashDumps');
 
 		// this.crashDetectionHandler();
 
@@ -474,7 +488,7 @@ class Application extends BaseApplication {
 		// manually call dispatchUpdateAll() to force an update.
 		Setting.dispatchUpdateAll();
 
-		await FoldersScreenUtils.refreshFolders();
+		await refreshFolders((action: any) => this.dispatch(action));
 
 		const tags = await Tag.allWithNotes();
 

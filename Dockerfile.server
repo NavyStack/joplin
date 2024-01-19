@@ -42,9 +42,9 @@ COPY packages/server ./packages/server
 # keep the cache.
 #
 # Note that `yarn install` ignores `NODE_ENV=production` and will install dev
-# dependencies too, but this is fine because we need them to build the app.
+# dependencies too, but this is fine because we need them to build the 
 
-RUN BUILD_SEQUENCIAL=1 yarn install --inline-builds \
+RUN BUILD_SEQUENCIAL=1 yarn install --inline-builds --verbose \
     && yarn cache clean \
     && rm -rf .yarn/berry
 
